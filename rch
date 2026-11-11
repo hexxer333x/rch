@@ -284,3 +284,4 @@ AutoButton.MouseButton1Click:Connect(function()
 end)
 
 print("✓ GUI loaded! Auto mode: " .. AUTO_MODE)
+print("coded by metempsychosis | blackbini on top nigga | tg: @blackbini6996")
