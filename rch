@@ -1,0 +1,286 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ===== Настройки =====
+local TOOL_NAME       = "Kick"   -- имя инструмента в игре
+local REMOTE_ARG      = "Кик"    -- аргумент для сервера
+local MAX_TRIES       = 5        -- сколько раз повторять Toggle, если сервер проигнорировал
+local TIMEOUT         = 0.5      -- сколько ждать реакции сервера на один Toggle (было 1.5)
+local SETTLE          = 0.03     -- пауза после смены состояния (было 0.15; если глючит, увеличь до 0.1)
+
+local AUTO_MODE       = "hit"    -- "hit": ресет после удара (попал/промахнулся) | "timer": ресет по таймеру
+local SWING_WINDOW    = 1.6      -- (hit) сколько сек после клика засчитывать попадание
+local MISS_DELAY      = 1.5      -- (hit) через сколько сек без попадания считать промах (было 0.5)
+local HIT_RANGE       = 15       -- (hit) макс. дистанция до цели для проверки по здоровью
+local HIT_RESET_DELAY = 0        -- (hit) пауза между попаданием и ресетом (0 = мгновенно)
+local TIMER_INTERVAL  = 1.3      -- (timer) интервал между ресетами
+local DEBUG           = false    -- писать в консоль (print тоже чуть тормозит)
+-- =====================
+
+local ToggleRemote = ReplicatedStorage:WaitForChild("InventorySystem"):WaitForChild("Action")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local function dbg(...)
+    if DEBUG then print("[KickReset]", ...) end
+end
+
+-- Убираем старый GUI, если скрипт запущен повторно
+local old = PlayerGui:FindFirstChild("KickResetGUI")
+if old then old:Destroy() end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "KickResetGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = PlayerGui
+
+local function makeButton(text, yOffset, borderColor)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 200, 0, 50)
+    b.Position = UDim2.new(0.5, -100, 0.1, yOffset)
+    b.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    b.BorderSizePixel = 2
+    b.BorderColor3 = borderColor
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.TextSize = 18
+    b.Font = Enum.Font.GothamBold
+    b.Parent = ScreenGui
+    return b
+end
+
+local Button     = makeButton("RESET COOLDOWN", 0,  Color3.fromRGB(255, 0, 0))
+local AutoButton = makeButton("AUTO: OFF",      60, Color3.fromRGB(120, 120, 120))
+
+local Working = false       -- идёт ресет
+local AutoEnabled = false
+local SwingUntil = 0        -- до какого момента засчитываем попадание
+local SwingToken = 0        -- id текущего замаха
+
+-- ===== Состояние Kick =====
+
+-- Где сейчас Kick: "hands" / "backpack" / "none"
+local function getState()
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChild(TOOL_NAME) then
+        return "hands"
+    end
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if backpack and backpack:FindFirstChild(TOOL_NAME) then
+        return "backpack"
+    end
+    return "none"
+end
+
+local function isAlive()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+-- Быстрое ожидание условия: проверка каждый кадр вместо task.wait(0.05)
+local function waitUntil(cond, timeout)
+    local t = 0
+    while t < timeout do
+        if cond() then return true end
+        t += RunService.Heartbeat:Wait()
+    end
+    return cond()
+end
+
+-- Один Toggle + ожидание, пока состояние реально изменится
+local function toggleAndWait(prevState)
+    ToggleRemote:FireServer("Toggle", REMOTE_ARG)
+    local ok = waitUntil(function() return getState() ~= prevState end, TIMEOUT)
+    if ok and SETTLE > 0 then task.wait(SETTLE) end
+    return ok
+end
+
+local function ensureNone()
+    for _ = 1, MAX_TRIES do
+        local s = getState()
+        if s == "none" then return true end
+        toggleAndWait(s)
+    end
+    return getState() == "none"
+end
+
+local function ensureHave()
+    for _ = 1, MAX_TRIES do
+        if getState() ~= "none" then return true end
+        toggleAndWait("none")
+    end
+    return getState() ~= "none"
+end
+
+local function equipKick()
+    for _ = 1, 4 do
+        local s = getState()
+        if s == "hands" then return true end
+        if s == "backpack" and isAlive() then
+            local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+            local tool = backpack and backpack:FindFirstChild(TOOL_NAME)
+            if hum and tool then
+                hum:EquipTool(tool)
+            end
+        end
+        if waitUntil(function() return getState() == "hands" end, 0.3) then
+            return true
+        end
+    end
+    return getState() == "hands"
+end
+
+-- ===== Сам ресет =====
+
+local function doReset(silent)
+    if Working or not isAlive() then return false end
+    Working = true
+    if not silent then Button.Text = "WORKING..." end
+
+    local removed  = ensureNone()
+    local restored = ensureHave()
+    local equipped = restored and equipKick()
+    local success = removed and restored and equipped
+
+    if not success and not silent then
+        Button.Text = "FAILED, RETRY"
+        task.wait(1)
+    end
+    Button.Text = "RESET COOLDOWN"
+    Working = false
+    return success
+end
+
+Button.MouseButton1Click:Connect(function()
+    doReset(false)
+end)
+
+-- ===== Авто-режим "hit": ресет после каждого удара (попал или нет) =====
+
+-- Попадание по игроку
+local function registerHit(targetName, how)
+    if not AutoEnabled or AUTO_MODE ~= "hit" then return end
+    if Working then return end
+    if tick() > SwingUntil then return end   -- вне окна замаха
+    SwingUntil = 0                           -- один удар = один ресет (также отменяет проверку на промах)
+    dbg("hit:", targetName, "via", how)
+    task.spawn(function()
+        if HIT_RESET_DELAY > 0 then task.wait(HIT_RESET_DELAY) end
+        if AutoEnabled then
+            doReset(true)
+        end
+    end)
+end
+
+-- Промах: за MISS_DELAY попадания не было
+local function onSwing()
+    SwingUntil = tick() + SWING_WINDOW
+    SwingToken += 1
+    local myToken = SwingToken
+
+    task.delay(MISS_DELAY, function()
+        if myToken ~= SwingToken then return end            -- уже был новый замах
+        if SwingUntil == 0 then return end                  -- попадание засчитано
+        if not AutoEnabled or AUTO_MODE ~= "hit" then return end
+        if Working then return end
+        SwingUntil = 0
+        dbg("miss -> reset")
+        doReset(true)
+    end)
+end
+
+-- Способ 1: рукоять Kick коснулась другого игрока
+local hookedTools = setmetatable({}, { __mode = "k" })
+
+local function hookTool(tool)
+    if hookedTools[tool] then return end
+    if not tool:IsA("Tool") or tool.Name ~= TOOL_NAME then return end
+    hookedTools[tool] = true
+
+    tool.Activated:Connect(onSwing)
+
+    task.spawn(function()
+        local handle = tool:WaitForChild("Handle", 3)
+        if not handle then return end
+        handle.Touched:Connect(function(part)
+            if tick() > SwingUntil then return end
+            local model = part:FindFirstAncestorOfClass("Model")
+            local plr = model and Players:GetPlayerFromCharacter(model)
+            if plr and plr ~= LocalPlayer then
+                registerHit(plr.Name, "touch")
+            end
+        end)
+    end)
+end
+
+local function hookMyCharacter(char)
+    for _, child in ipairs(char:GetChildren()) do
+        hookTool(child)
+    end
+    char.ChildAdded:Connect(hookTool)
+end
+
+if LocalPlayer.Character then hookMyCharacter(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(hookMyCharacter)
+
+-- Способ 2: у другого игрока рядом упало здоровье во время замаха
+local function distanceTo(char)
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not (myRoot and root) then return math.huge end
+    return (myRoot.Position - root.Position).Magnitude
+end
+
+local function watchPlayer(plr)
+    if plr == LocalPlayer then return end
+
+    local function watchCharacter(char)
+        local hum = char:WaitForChild("Humanoid", 5)
+        if not hum then return end
+        local last = hum.Health
+        hum.HealthChanged:Connect(function(new)
+            local dropped = new < last
+            last = new
+            if dropped and tick() <= SwingUntil and distanceTo(char) <= HIT_RANGE then
+                registerHit(plr.Name, "health")
+            end
+        end)
+    end
+
+    if plr.Character then task.spawn(watchCharacter, plr.Character) end
+    plr.CharacterAdded:Connect(watchCharacter)
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do watchPlayer(plr) end
+Players.PlayerAdded:Connect(watchPlayer)
+
+-- ===== Авто-режим "timer" =====
+
+task.spawn(function()
+    while ScreenGui.Parent do
+        task.wait(TIMER_INTERVAL)
+        if AutoEnabled and AUTO_MODE == "timer" and not Working and getState() == "hands" then
+            doReset(true)
+        end
+    end
+end)
+
+-- ===== Кнопка AUTO =====
+
+AutoButton.MouseButton1Click:Connect(function()
+    AutoEnabled = not AutoEnabled
+    SwingUntil = 0
+    if AutoEnabled then
+        AutoButton.Text = "AUTO: ON"
+        AutoButton.BorderColor3 = Color3.fromRGB(0, 255, 0)
+    else
+        AutoButton.Text = "AUTO: OFF"
+        AutoButton.BorderColor3 = Color3.fromRGB(120, 120, 120)
+    end
+end)
+
+print("✓ GUI loaded! Auto mode: " .. AUTO_MODE)
